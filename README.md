@@ -19,16 +19,17 @@ npm install
 
 `AZURE_OPENAI_API_VERSION` は通常空で問題ありません。
 
-## 2. 起動
+## 2. 起動 (Azure Functions)
 
 ```powershell
-npm run dev
+npm install
+npm run start
 ```
 
 起動後:
 
-- Health: `GET http://localhost:8787/api/health`
-- Search: `POST http://localhost:8787/api/rag/search`
+- Health: `GET http://localhost:7071/api/health`
+- Search: `POST http://localhost:7071/api/rag/search`
 
 ## 3. リクエスト / レスポンス
 

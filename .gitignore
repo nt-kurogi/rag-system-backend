@@ -5,6 +5,7 @@ node_modules/
 .env
 .env.*
 !.env.example
+local.settings.json
 
 # logs
 logs/
@@ -19,6 +20,7 @@ dist/
 coverage/
 .cache/
 .eslintcache
+.azurefunctions/
 
 # OS / editor
 .DS_Store
