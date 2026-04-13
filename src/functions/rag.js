@@ -1,6 +1,11 @@
 import "dotenv/config";
 import { app } from "@azure/functions";
 import { AzureKeyCredential, SearchClient } from "@azure/search-documents";
+import {
+  BlobSASPermissions,
+  StorageSharedKeyCredential,
+  generateBlobSASQueryParameters,
+} from "@azure/storage-blob";
 
 function requiredEnv(name) {
   const value = process.env[name];
@@ -19,6 +24,9 @@ const config = {
   searchEndpoint: requiredEnv("AZURE_SEARCH_ENDPOINT"),
   searchApiKey: requiredEnv("AZURE_SEARCH_API_KEY"),
   defaultSearchIndex: process.env.AZURE_SEARCH_INDEX || "",
+  storageAccountName: process.env.AZURE_STORAGE_ACCOUNT_NAME || "",
+  storageAccountKey: process.env.AZURE_STORAGE_ACCOUNT_KEY || "",
+  blobSasExpiryMinutes: Number(process.env.BLOB_SAS_EXPIRY_MINUTES || 30),
 };
 
 const searchCredential = new AzureKeyCredential(config.searchApiKey);
@@ -68,6 +76,7 @@ function toCitation(result, fallbackId) {
     "filepath",
     "path",
   ]);
+  const signedUrl = signBlobUrlIfPossible(url);
 
   const snippet =
     selectBestField(doc, ["content", "chunk", "text", "body", "description"]) ||
@@ -76,9 +85,84 @@ function toCitation(result, fallbackId) {
   return {
     id: String(doc.id ?? doc.key ?? fallbackId),
     title,
-    url,
+    url: signedUrl,
     snippet,
   };
+}
+
+function isAzureBlobUrl(parsedUrl) {
+  return parsedUrl.hostname.endsWith(".blob.core.windows.net");
+}
+
+function signBlobUrlIfPossible(rawUrl) {
+  if (!rawUrl || !config.storageAccountName || !config.storageAccountKey) {
+    return rawUrl;
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(rawUrl);
+  } catch {
+    return rawUrl;
+  }
+
+  if (!isAzureBlobUrl(parsedUrl)) {
+    return rawUrl;
+  }
+
+  if (parsedUrl.searchParams.has("sig")) {
+    return rawUrl;
+  }
+
+  const accountName = parsedUrl.hostname.split(".")[0] || "";
+  if (accountName !== config.storageAccountName) {
+    return rawUrl;
+  }
+
+  const pathParts = parsedUrl.pathname.split("/").filter(Boolean);
+  if (pathParts.length < 2) {
+    return rawUrl;
+  }
+
+  const containerName = pathParts[0];
+  let blobName = pathParts.slice(1).join("/");
+  try {
+    blobName = decodeURIComponent(blobName);
+  } catch {
+    return rawUrl;
+  }
+
+  try {
+    const sharedKeyCredential = new StorageSharedKeyCredential(
+      config.storageAccountName,
+      config.storageAccountKey,
+    );
+    const startsOn = new Date(Date.now() - 5 * 60 * 1000);
+    const expiresOn = new Date(
+      Date.now() + Math.max(1, config.blobSasExpiryMinutes) * 60 * 1000,
+    );
+
+    const sas = generateBlobSASQueryParameters(
+      {
+        containerName,
+        blobName,
+        permissions: BlobSASPermissions.parse("r"),
+        startsOn,
+        expiresOn,
+        protocol: "https",
+      },
+      sharedKeyCredential,
+    );
+
+    const sasQuery = new URLSearchParams(sas.toString());
+    for (const [key, value] of sasQuery.entries()) {
+      parsedUrl.searchParams.set(key, value);
+    }
+
+    return parsedUrl.toString();
+  } catch {
+    return rawUrl;
+  }
 }
 
 async function retrieveContext(query, indexName, topK) {
