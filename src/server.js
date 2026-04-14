@@ -27,11 +27,17 @@ const config = {
   backendApiKey: process.env.BACKEND_API_KEY || '',
   openAiEndpoint: requiredEnv('AZURE_OPENAI_ENDPOINT').replace(/\/$/, ''),
   openAiApiKey: requiredEnv('AZURE_OPENAI_API_KEY'),
-  openAiDeployment: requiredEnv('AZURE_OPENAI_DEPLOYMENT'),
+  openAiDeploymentRag:
+    process.env.AZURE_OPENAI_DEPLOYMENT_RAG ||
+    requiredEnv('AZURE_OPENAI_DEPLOYMENT'),
+  openAiDeploymentGpt54: process.env.AZURE_OPENAI_DEPLOYMENT_GPT54 || '',
   searchEndpoint: requiredEnv('AZURE_SEARCH_ENDPOINT'),
   searchApiKey: requiredEnv('AZURE_SEARCH_API_KEY'),
   defaultSearchIndex: process.env.AZURE_SEARCH_INDEX || '',
 }
+
+const MODE_RAG = 'rag'
+const MODE_GPT54 = 'gpt54'
 
 const searchCredential = new AzureKeyCredential(config.searchApiKey)
 
@@ -124,14 +130,37 @@ function extractResponseText(data) {
   return 'No answer returned from model.'
 }
 
-async function generateAnswer(query, context) {
+function buildInstructions(mode) {
+  if (mode === MODE_RAG) {
+    return 'You are a RAG assistant. Use only the provided context. If information is insufficient, clearly say so. Keep answer concise and include citation markers like [#1].'
+  }
+
+  return 'You are a helpful assistant. Answer in Japanese unless the user requests another language. Keep the response concise and practical.'
+}
+
+function buildModelInput(mode, query, context) {
+  if (mode === MODE_RAG) {
+    return `Question:\n${query}\n\nContext:\n${context || '(no context)'}`
+  }
+
+  return `Question:\n${query}`
+}
+
+function resolveDeployment(mode) {
+  if (mode === MODE_GPT54) {
+    return config.openAiDeploymentGpt54 || config.openAiDeploymentRag
+  }
+
+  return config.openAiDeploymentRag
+}
+
+async function generateAnswer({ query, context, mode, deployment }) {
   const url = `${config.openAiEndpoint}/openai/v1/responses`
 
   const body = {
-    model: config.openAiDeployment,
-    instructions:
-      'You are a RAG assistant. Use only the provided context. If information is insufficient, clearly say so. Keep answer concise and include citation markers like [#1].',
-    input: `Question:\n${query}\n\nContext:\n${context || '(no context)'}`,
+    model: deployment,
+    instructions: buildInstructions(mode),
+    input: buildModelInput(mode, query, context),
     max_output_tokens: 800,
   }
 
@@ -167,30 +196,56 @@ app.post('/api/rag/search', async (req, res) => {
     }
 
     const query = (req.body?.query || '').trim()
-    const indexName = (req.body?.indexName || config.defaultSearchIndex || '').trim()
-    const requestedTopK = Number(req.body?.topK || 5)
-    const topK = Number.isFinite(requestedTopK)
-      ? Math.max(1, Math.min(20, Math.floor(requestedTopK)))
-      : 5
+    const mode = String(req.body?.mode || MODE_RAG).trim().toLowerCase()
 
     if (!query) {
       return res.status(400).json({ error: 'query is required.' })
     }
 
-    if (!indexName) {
-      return res.status(400).json({
-        error: 'indexName is required. Pass in request or set AZURE_SEARCH_INDEX.',
+    if (mode !== MODE_RAG && mode !== MODE_GPT54) {
+      return res.status(400).json({ error: "mode must be either 'rag' or 'gpt54'." })
+    }
+
+    let indexName = null
+    let topK = null
+    let citations = []
+    let context = ''
+
+    if (mode === MODE_RAG) {
+      indexName = (req.body?.indexName || config.defaultSearchIndex || '').trim()
+      const requestedTopK = Number(req.body?.topK || 5)
+      topK = Number.isFinite(requestedTopK)
+        ? Math.max(1, Math.min(20, Math.floor(requestedTopK)))
+        : 5
+
+      if (!indexName) {
+        return res.status(400).json({
+          error: 'indexName is required. Pass in request or set AZURE_SEARCH_INDEX.',
+        })
+      }
+
+      const retrieval = await retrieveContext(query, indexName, topK)
+      citations = retrieval.citations
+      context = retrieval.context
+    }
+
+    const deployment = resolveDeployment(mode)
+    if (!deployment) {
+      return res.status(500).json({
+        error:
+          'OpenAI deployment is not configured. Set AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_GPT54.',
       })
     }
 
-    const { citations, context } = await retrieveContext(query, indexName, topK)
-    const answer = await generateAnswer(query, context)
+    const answer = await generateAnswer({ query, context, mode, deployment })
 
     return res.json({
       answer,
       citations,
       meta: {
         query,
+        mode,
+        model: deployment,
         indexName,
         topK,
         retrieved: citations.length,

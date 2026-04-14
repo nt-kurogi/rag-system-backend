@@ -13,6 +13,8 @@ npm install
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_API_KEY`
 - `AZURE_OPENAI_DEPLOYMENT`（モデル名ではなくデプロイ名）
+- （任意）`AZURE_OPENAI_DEPLOYMENT_RAG`
+- （任意）`AZURE_OPENAI_DEPLOYMENT_GPT54`
 - `AZURE_SEARCH_ENDPOINT`
 - `AZURE_SEARCH_API_KEY`
 - `AZURE_SEARCH_INDEX`（固定インデックス）
@@ -38,11 +40,15 @@ Request:
 ```json
 {
   "query": "有給休暇の繰越条件を教えて",
+  "mode": "rag",
   "topK": 5
 }
 ```
 
 インデックスは `AZURE_SEARCH_INDEX` を使用します（固定運用）。
+
+- `mode: "rag"`: 社内RAG（検索 + 回答）
+- `mode: "gpt54"`: GPT-5.4（検索なし）
 
 Response:
 
@@ -59,6 +65,8 @@ Response:
   ],
   "meta": {
     "query": "...",
+    "mode": "rag",
+    "model": "your-deployment-name",
     "indexName": "...",
     "topK": 5,
     "retrieved": 5
