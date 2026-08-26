@@ -39,11 +39,11 @@ const config = {
   openAiDeploymentGpt56Sol:
     process.env.AZURE_OPENAI_DEPLOYMENT_GPT56_SOL ||
     process.env.AZURE_OPENAI_DEPLOYMENT_GPT56 ||
-    "",
+    "gpt-5.6-sol",
   openAiDeploymentGpt56Terra:
-    process.env.AZURE_OPENAI_DEPLOYMENT_GPT56_TERRA || "",
+    process.env.AZURE_OPENAI_DEPLOYMENT_GPT56_TERRA || "gpt-5.6-terra",
   openAiDeploymentGpt56Luna:
-    process.env.AZURE_OPENAI_DEPLOYMENT_GPT56_LUNA || "",
+    process.env.AZURE_OPENAI_DEPLOYMENT_GPT56_LUNA || "gpt-5.6-luna",
   openAiGpt56DefaultModel:
     process.env.AZURE_OPENAI_GPT56_DEFAULT_MODEL || "gpt-5.6-sol",
   openAiMaxOutputTokens: Number(
