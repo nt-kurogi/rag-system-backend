@@ -9,9 +9,16 @@
     "dev": "func start --verbose"
   },
   "dependencies": {
+    "@azure/cosmos": "^4.9.2",
     "@azure/functions": "^4.7.3",
     "@azure/search-documents": "^12.1.0",
     "@azure/storage-blob": "^12.31.0",
-    "dotenv": "^16.6.1"
+    "docx": "^9.7.1",
+    "dotenv": "^16.6.1",
+    "exceljs": "^4.4.0",
+    "jose": "^6.2.2",
+    "noto-fontface-cjk-jp": "^1.0.2",
+    "pdfkit": "^0.20.1",
+    "pptxgenjs": "^4.0.1"
   }
 }

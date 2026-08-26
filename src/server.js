@@ -2,15 +2,18 @@
 import express from 'express'
 import cors from 'cors'
 import { AzureKeyCredential, SearchClient } from '@azure/search-documents'
+import { createRemoteJWKSet, jwtVerify } from 'jose'
 
 const app = express()
 
 app.use(express.json({ limit: '1mb' }))
 
-const allowedOrigin = process.env.ALLOWED_ORIGIN || 'http://localhost:5173'
+const allowedOrigin =
+  process.env.ALLOWED_ORIGIN || 'https://green-stone-03f1e0d00.7.azurestaticapps.net'
 app.use(
   cors({
     origin: allowedOrigin,
+    allowedHeaders: ['Content-Type', 'api-key', 'Authorization'],
   }),
 )
 
@@ -25,19 +28,66 @@ function requiredEnv(name) {
 const config = {
   port: Number(process.env.PORT || 8787),
   backendApiKey: process.env.BACKEND_API_KEY || '',
+  entraAuthEnabled: String(process.env.ENTRA_AUTH_ENABLED || 'false').toLowerCase() === 'true',
+  entraTenantId: process.env.ENTRA_TENANT_ID || '',
+  entraClientId: process.env.ENTRA_CLIENT_ID || '',
   openAiEndpoint: requiredEnv('AZURE_OPENAI_ENDPOINT').replace(/\/$/, ''),
   openAiApiKey: requiredEnv('AZURE_OPENAI_API_KEY'),
   openAiDeploymentRag:
     process.env.AZURE_OPENAI_DEPLOYMENT_RAG ||
     requiredEnv('AZURE_OPENAI_DEPLOYMENT'),
-  openAiDeploymentGpt54: process.env.AZURE_OPENAI_DEPLOYMENT_GPT54 || '',
+  openAiDeploymentGpt56: process.env.AZURE_OPENAI_DEPLOYMENT_GPT56 || '',
   searchEndpoint: requiredEnv('AZURE_SEARCH_ENDPOINT'),
   searchApiKey: requiredEnv('AZURE_SEARCH_API_KEY'),
   defaultSearchIndex: process.env.AZURE_SEARCH_INDEX || '',
 }
 
+function buildEntraIssuer(tenantId) {
+  return `https://login.microsoftonline.com/${tenantId}/v2.0`
+}
+
+function buildEntraJwksUri(tenantId) {
+  return `https://login.microsoftonline.com/${tenantId}/discovery/v2.0/keys`
+}
+
+let entraJwks = null
+function getEntraJwks() {
+  if (!entraJwks) {
+    entraJwks = createRemoteJWKSet(new URL(buildEntraJwksUri(config.entraTenantId)))
+  }
+  return entraJwks
+}
+
+async function verifyEntraAuthorization(req) {
+  if (!config.entraAuthEnabled) {
+    return { ok: true }
+  }
+
+  if (!config.entraTenantId || !config.entraClientId) {
+    return { ok: false, message: 'ENTRA_TENANT_ID / ENTRA_CLIENT_ID is required when ENTRA_AUTH_ENABLED=true.' }
+  }
+
+  const auth = req.header('authorization') || ''
+  const match = auth.match(/^Bearer\\s+(.+)$/i)
+  if (!match) {
+    return { ok: false, message: 'Missing bearer token.' }
+  }
+
+  try {
+    await jwtVerify(match[1], getEntraJwks(), {
+      issuer: buildEntraIssuer(config.entraTenantId),
+      audience: config.entraClientId,
+    })
+    return { ok: true }
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : 'Invalid token'
+    return { ok: false, message: `Invalid Entra token: ${detail}` }
+  }
+}
+
 const MODE_RAG = 'rag'
-const MODE_GPT54 = 'gpt54'
+const MODE_GPT56 = 'gpt56'
+const LEGACY_MODE_GPT54 = 'gpt54'
 
 const searchCredential = new AzureKeyCredential(config.searchApiKey)
 
@@ -147,8 +197,8 @@ function buildModelInput(mode, query, context) {
 }
 
 function resolveDeployment(mode) {
-  if (mode === MODE_GPT54) {
-    return config.openAiDeploymentGpt54 || config.openAiDeploymentRag
+  if (mode === MODE_GPT56) {
+    return config.openAiDeploymentGpt56
   }
 
   return config.openAiDeploymentRag
@@ -188,6 +238,11 @@ app.get('/api/health', (_req, res) => {
 
 app.post('/api/rag/search', async (req, res) => {
   try {
+    const authCheck = await verifyEntraAuthorization(req)
+    if (!authCheck.ok) {
+      return res.status(401).json({ error: authCheck.message })
+    }
+
     if (config.backendApiKey) {
       const incoming = req.header('api-key') || ''
       if (incoming !== config.backendApiKey) {
@@ -196,14 +251,15 @@ app.post('/api/rag/search', async (req, res) => {
     }
 
     const query = (req.body?.query || '').trim()
-    const mode = String(req.body?.mode || MODE_RAG).trim().toLowerCase()
+    const requestedMode = String(req.body?.mode || MODE_RAG).trim().toLowerCase()
+    const mode = requestedMode === LEGACY_MODE_GPT54 ? MODE_GPT56 : requestedMode
 
     if (!query) {
       return res.status(400).json({ error: 'query is required.' })
     }
 
-    if (mode !== MODE_RAG && mode !== MODE_GPT54) {
-      return res.status(400).json({ error: "mode must be either 'rag' or 'gpt54'." })
+    if (mode !== MODE_RAG && mode !== MODE_GPT56) {
+      return res.status(400).json({ error: "mode must be either 'rag' or 'gpt56'." })
     }
 
     let indexName = null
@@ -233,7 +289,7 @@ app.post('/api/rag/search', async (req, res) => {
     if (!deployment) {
       return res.status(500).json({
         error:
-          'OpenAI deployment is not configured. Set AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_GPT54.',
+          'OpenAI deployment is not configured. Set AZURE_OPENAI_DEPLOYMENT or AZURE_OPENAI_DEPLOYMENT_GPT56.',
       })
     }
 
