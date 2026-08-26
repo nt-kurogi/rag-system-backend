@@ -2981,7 +2981,7 @@ app.http("chat-list", {
 app.http("chat-get", {
   methods: ["GET", "PATCH", "DELETE", "OPTIONS"],
   authLevel: "anonymous",
-  route: "chat/{id}",
+  route: "chat/{id:guid}",
   handler: async (req) => {
     if (req.method === "OPTIONS") {
       return { status: 204, headers: getCorsHeaders(req) };
@@ -3091,7 +3091,7 @@ app.http("chat-get", {
 app.http("chat-attachments", {
   methods: ["POST", "OPTIONS"],
   authLevel: "anonymous",
-  route: "chat/{id}/attachments",
+  route: "chat/{id:guid}/attachments",
   handler: async (req) => {
     if (req.method === "OPTIONS") {
       return { status: 204, headers: getCorsHeaders(req) };
@@ -3203,7 +3203,7 @@ app.http("chat-attachments", {
 app.http("chat-artifact", {
   methods: ["POST", "OPTIONS"],
   authLevel: "anonymous",
-  route: "chat/{id}/artifact",
+  route: "chat/{id:guid}/artifact",
   handler: async (req) => {
     if (req.method === "OPTIONS") {
       return { status: 204, headers: getCorsHeaders(req) };
@@ -3436,7 +3436,7 @@ app.http("chat-artifact", {
 app.http("chat-message", {
   methods: ["POST", "OPTIONS"],
   authLevel: "anonymous",
-  route: "chat/{id}/message",
+  route: "chat/{id:guid}/message",
   handler: async (req) => {
     if (req.method === "OPTIONS") {
       return { status: 204, headers: getCorsHeaders(req) };
@@ -3589,7 +3589,7 @@ app.http("chat-message", {
 app.http("chat-message-stream", {
   methods: ["POST", "OPTIONS"],
   authLevel: "anonymous",
-  route: "chat/{id}/message/stream",
+  route: "chat/{id:guid}/message/stream",
   handler: async (req) => {
     if (req.method === "OPTIONS") {
       return { status: 204, headers: getCorsHeaders(req) };
