@@ -77,6 +77,11 @@ const config = {
   cosmosAuditContainerName: process.env.COSMOS_DB_AUDIT_CONTAINER || "audit-logs",
   cosmosUsageContainerName:
     process.env.COSMOS_DB_USAGE_CONTAINER || "usage-counters",
+  cosmosArtifactJobContainerName:
+    process.env.COSMOS_DB_ARTIFACT_JOB_CONTAINER || "artifact-jobs",
+  artifactJobRetentionDays: Number(
+    process.env.ARTIFACT_JOB_RETENTION_DAYS || 7,
+  ),
   monthlyTokenLimitDefault: Number(
     process.env.MONTHLY_TOKEN_LIMIT_DEFAULT || 5_000_000,
   ),
@@ -468,6 +473,31 @@ async function getAuditContainer() {
   })();
 
   return cosmosAuditContainerPromise;
+}
+
+let cosmosArtifactJobContainerPromise = null;
+async function getArtifactJobContainer() {
+  if (cosmosArtifactJobContainerPromise) {
+    return cosmosArtifactJobContainerPromise;
+  }
+
+  cosmosArtifactJobContainerPromise = (async () => {
+    const endpoint = requiredEnv("COSMOS_DB_ENDPOINT");
+    const key = requiredEnv("COSMOS_DB_KEY");
+    const client = new CosmosClient({ endpoint, key });
+
+    const { database } = await client.databases.createIfNotExists({
+      id: config.cosmosDatabaseName,
+    });
+    const { container } = await database.containers.createIfNotExists({
+      id: config.cosmosArtifactJobContainerName,
+      partitionKey: { paths: ["/userId"] },
+      defaultTtl: -1,
+    });
+    return container;
+  })();
+
+  return cosmosArtifactJobContainerPromise;
 }
 
 let cosmosUsageContainerPromise = null;
@@ -1340,6 +1370,135 @@ function toClientConversation(conversation) {
     attachments: [...attachmentMap.values()],
     messages,
   };
+}
+
+function getArtifactJobTtlSeconds() {
+  const days = Math.max(
+    1,
+    Math.min(90, Math.floor(config.artifactJobRetentionDays || 7)),
+  );
+  return days * 24 * 60 * 60;
+}
+
+function makeArtifactJobExpiration(createdAt = nowIso()) {
+  return new Date(
+    Date.parse(createdAt) + getArtifactJobTtlSeconds() * 1000,
+  ).toISOString();
+}
+
+function toStoredUsageLease(lease) {
+  if (!lease?.ok) return null;
+  return {
+    ok: true,
+    id: lease.id,
+    userId: lease.userId,
+    reservationTokens: lease.reservationTokens,
+    rawReservationTokens: lease.rawReservationTokens,
+    estimatedInputTokens: lease.estimatedInputTokens,
+    modelId: lease.modelId,
+    reasoningEffort: lease.reasoningEffort,
+    effortWeight: lease.effortWeight,
+    policy: lease.policy,
+    usage: lease.usage,
+  };
+}
+
+function sanitizeArtifactJobPayload(payload, format) {
+  return {
+    query: String(payload?.query || "").trim(),
+    format,
+    modelId: String(payload?.modelId || "").trim(),
+    reasoningEffort: String(payload?.reasoningEffort || "").trim(),
+    templateId: String(payload?.templateId || "default").trim(),
+    webSearch: payload?.webSearch !== false,
+    attachmentIds: normalizeAttachmentIds(payload?.attachmentIds),
+    indexName: String(payload?.indexName || "").trim(),
+    topK: Number(payload?.topK || 5),
+  };
+}
+
+function toClientArtifactJob(job) {
+  if (!job) return null;
+  const artifact = job.artifact ? toClientAttachment(job.artifact) : null;
+  return {
+    id: job.id,
+    conversationId: job.conversationId,
+    format: job.format,
+    query: job.query,
+    status: job.status,
+    progress: Math.max(0, Math.min(100, Number(job.progress || 0))),
+    stage: job.stage || "",
+    error: job.error || "",
+    artifact,
+    createdAt: job.createdAt || "",
+    updatedAt: job.updatedAt || "",
+    completedAt: job.completedAt || "",
+    retryOf: job.retryOf || "",
+  };
+}
+
+async function createArtifactJob(job) {
+  const container = await getArtifactJobContainer();
+  const createdAt = job.createdAt || nowIso();
+  const item = {
+    ...job,
+    id: job.id || randomUUID(),
+    createdAt,
+    updatedAt: createdAt,
+    expiresAt: makeArtifactJobExpiration(createdAt),
+    ttl: getArtifactJobTtlSeconds(),
+  };
+  const { resource } = await container.items.create(item);
+  return resource || item;
+}
+
+async function getArtifactJob(userId, jobId) {
+  const container = await getArtifactJobContainer();
+  try {
+    const { resource } = await container.item(jobId, userId).read();
+    return resource || null;
+  } catch (error) {
+    if (Number(error?.code || error?.statusCode) === 404) return null;
+    throw error;
+  }
+}
+
+async function listArtifactJobs(userId, conversationId) {
+  const container = await getArtifactJobContainer();
+  const querySpec = {
+    query:
+      "SELECT * FROM c WHERE c.userId = @userId AND c.conversationId = @conversationId ORDER BY c.createdAt DESC",
+    parameters: [
+      { name: "@userId", value: userId },
+      { name: "@conversationId", value: conversationId },
+    ],
+  };
+  const { resources } = await container.items.query(querySpec).fetchAll();
+  return resources || [];
+}
+
+async function patchArtifactJob(job, operations) {
+  const container = await getArtifactJobContainer();
+  const updatedAt = nowIso();
+  const { resource } = await container.item(job.id, job.userId).patch([
+    ...operations,
+    { op: "set", path: "/updatedAt", value: updatedAt },
+  ]);
+  return resource || { ...job, updatedAt };
+}
+
+async function refreshUsageLease(lease) {
+  if (!lease?.ok) return;
+  try {
+    const container = await getUsageContainer();
+    const updatedAt = nowIso();
+    await container.item(lease.id, lease.userId).patch([
+      { op: "set", path: "/activeUpdatedAt", value: updatedAt },
+      { op: "set", path: "/updatedAt", value: updatedAt },
+    ]);
+  } catch {
+    // A status poll must not fail just because lease refresh was unavailable.
+  }
 }
 
 function toSafeInt(value, fallback) {
@@ -2312,6 +2471,69 @@ async function requestAssistant(prepared, { stream = false } = {}) {
   };
 }
 
+async function startBackgroundAssistant(prepared) {
+  const response = await fetch(
+    `${config.openAiEndpoint}/openai/v1/responses`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-key": config.openAiApiKey,
+      },
+      body: JSON.stringify({
+        ...prepared.body,
+        background: true,
+        store: true,
+        stream: false,
+      }),
+    },
+  );
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`Azure OpenAI error (${response.status}): ${detail}`);
+  }
+  return response.json();
+}
+
+async function retrieveBackgroundAssistant(responseId) {
+  const response = await fetch(
+    `${config.openAiEndpoint}/openai/v1/responses/${encodeURIComponent(responseId)}`,
+    {
+      method: "GET",
+      headers: { "api-key": config.openAiApiKey },
+    },
+  );
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`Azure OpenAI status error (${response.status}): ${detail}`);
+  }
+  return response.json();
+}
+
+async function cancelBackgroundAssistant(responseId) {
+  if (!responseId) return;
+  try {
+    await fetch(
+      `${config.openAiEndpoint}/openai/v1/responses/${encodeURIComponent(responseId)}/cancel`,
+      {
+        method: "POST",
+        headers: { "api-key": config.openAiApiKey },
+      },
+    );
+  } catch {
+    // Cancellation is best effort when job persistence failed.
+  }
+}
+
+function getBackgroundResponseError(data) {
+  const direct = data?.error?.message || data?.incomplete_details?.reason;
+  if (direct) return String(direct);
+  for (const item of Array.isArray(data?.output) ? data.output : []) {
+    if (item?.error?.message) return String(item.error.message);
+  }
+  return "資料生成を完了できませんでした。再試行してください。";
+}
+
 function estimatePreparedInputTokens(prepared) {
   const serialized = JSON.stringify({
     instructions: prepared?.body?.instructions || "",
@@ -2415,6 +2637,325 @@ function makeGeneratedFileName(title, extension) {
     .replace(/\.[A-Za-z0-9]+$/, "")
     .slice(0, 100);
   return `${base || "生成資料"}${extension}`;
+}
+
+async function enqueueArtifactJob({
+  principal,
+  conversation,
+  payload,
+  format,
+  saveUserMessage = true,
+  retryOf = "",
+}) {
+  const validation = validateAssistantPayload(
+    { ...payload, mode: MODE_GPT56 },
+    conversation,
+  );
+  if (!validation.ok) return validation;
+
+  const prepared = await prepareArtifactRequest(
+    payload,
+    conversation,
+    validation,
+    format,
+  );
+  if (!prepared.ok) return prepared;
+
+  let savedConversation = conversation;
+  if (saveUserMessage) {
+    const userMessage = {
+      id: randomUUID(),
+      role: "user",
+      content: validation.query,
+      attachmentIds: validation.attachmentIds,
+      requestedArtifactFormat: format,
+      createdAt: nowIso(),
+    };
+    savedConversation = await appendConversationMessage(
+      conversation,
+      userMessage,
+      {
+        updateTitle:
+          !conversation.title || conversation.title === "新しいチャット",
+      },
+    );
+  }
+
+  const inputTokens = await countPreparedInputTokens(prepared);
+  const usageLease = await reserveUsage(principal, {
+    inputTokens,
+    maxOutputTokens: prepared.body.max_output_tokens,
+    modelId: prepared.meta.mode === MODE_RAG ? "rag" : prepared.meta.model,
+    reasoningEffort: prepared.meta.reasoningEffort,
+  });
+  if (!usageLease.ok) {
+    const limitResult = makeUsageLimitResult(usageLease);
+    return {
+      ...limitResult,
+      userMessageSaved: saveUserMessage,
+      conversation: savedConversation,
+    };
+  }
+
+  let responseId = "";
+  try {
+    const response = await startBackgroundAssistant(prepared);
+    responseId = String(response?.id || "").trim();
+    if (!responseId) {
+      throw new Error("バックグラウンド生成の受付IDが返されませんでした。");
+    }
+    const providerStatus = String(response?.status || "queued").toLowerCase();
+    const createdAt = nowIso();
+    const job = await createArtifactJob({
+      id: randomUUID(),
+      userId: principal.userId,
+      userName: principal.userName || principal.userId,
+      conversationId: conversation.id,
+      responseId,
+      format,
+      query: validation.query,
+      status: providerStatus === "in_progress" ? "in_progress" : "queued",
+      progress: providerStatus === "in_progress" ? 35 : 10,
+      stage:
+        providerStatus === "in_progress"
+          ? "AIが資料内容を作成しています"
+          : "生成処理を受け付けました",
+      error: "",
+      requestPayload: sanitizeArtifactJobPayload(payload, format),
+      preparedMeta: prepared.meta,
+      citations: prepared.citations,
+      usageLease: toStoredUsageLease(usageLease),
+      usageSettled: false,
+      retryOf,
+      createdAt,
+    });
+    return {
+      ok: true,
+      job,
+      conversation: savedConversation,
+      usage: usageLease.usage || null,
+    };
+  } catch (error) {
+    if (responseId) await cancelBackgroundAssistant(responseId);
+    try {
+      await releaseUsage(usageLease);
+    } catch {
+      // Preserve the enqueue error.
+    }
+    throw error;
+  }
+}
+
+async function markArtifactJobFailed(job, errorMessage, responseUsage = null) {
+  let usageStatus = job.usageStatus || null;
+  if (job.usageLease?.ok && !job.usageSettled) {
+    try {
+      usageStatus = responseUsage
+        ? await settleUsage(job.usageLease, responseUsage)
+        : await releaseUsage(job.usageLease);
+    } catch {
+      usageStatus = job.usageLease.usage || null;
+    }
+  }
+  return patchArtifactJob(job, [
+    { op: "set", path: "/status", value: "failed" },
+    { op: "set", path: "/progress", value: 100 },
+    { op: "set", path: "/stage", value: "生成に失敗しました" },
+    { op: "set", path: "/error", value: String(errorMessage || "生成に失敗しました。") },
+    { op: "set", path: "/usageSettled", value: true },
+    { op: "set", path: "/usageStatus", value: usageStatus },
+    { op: "set", path: "/completedAt", value: nowIso() },
+  ]);
+}
+
+async function finalizeArtifactJob(job, responseData) {
+  const conversation = await getConversation(job.userId, job.conversationId);
+  if (!conversation) {
+    return markArtifactJobFailed(job, "対象の会話が見つかりませんでした。", responseData?.usage);
+  }
+
+  const existingMessage = (Array.isArray(conversation.messages)
+    ? conversation.messages
+    : []
+  ).find((message) => message?.meta?.artifactJobId === job.id);
+  if (existingMessage) {
+    const existingAttachmentId = normalizeAttachmentIds(
+      existingMessage.attachmentIds,
+    )[0];
+    const existingArtifact = (Array.isArray(conversation.attachments)
+      ? conversation.attachments
+      : []
+    ).find((attachment) => attachment.id === existingAttachmentId);
+    return patchArtifactJob(job, [
+      { op: "set", path: "/status", value: "completed" },
+      { op: "set", path: "/progress", value: 100 },
+      { op: "set", path: "/stage", value: "完了" },
+      { op: "set", path: "/artifact", value: existingArtifact || null },
+      { op: "set", path: "/completedAt", value: nowIso() },
+    ]);
+  }
+
+  let usageStatus = job.usageStatus || null;
+  if (job.usageLease?.ok && !job.usageSettled) {
+    try {
+      usageStatus = await settleUsage(job.usageLease, responseData?.usage, {
+        chargeUnknown: !responseData?.usage,
+      });
+    } catch {
+      usageStatus = job.usageLease.usage || null;
+    }
+    job = await patchArtifactJob(job, [
+      { op: "set", path: "/usageSettled", value: true },
+      { op: "set", path: "/usageStatus", value: usageStatus },
+    ]);
+  }
+
+  const generated = {
+    answer: extractResponseText(responseData),
+    responseId: String(responseData?.id || job.responseId || ""),
+    usage: responseData?.usage || null,
+    webCitations: extractWebCitations(responseData),
+    raw: responseData,
+  };
+  const preparedMeta = { ...(job.preparedMeta || {}) };
+  preparedMeta.usage = calculateUsageAccounting(
+    generated.usage
+      ? normalizeResponseUsage(generated.usage)
+      : makeLeaseFallbackUsage(job.usageLease),
+    {
+      modelId: preparedMeta.model,
+      reasoningEffort: preparedMeta.reasoningEffort,
+    },
+  );
+
+  let artifact;
+  let artifactTitle;
+  if (job.format === "png") {
+    const imageBuffer = extractGeneratedImage(responseData);
+    if (!imageBuffer?.length) {
+      throw new Error("画像生成結果が返されませんでした。");
+    }
+    artifactTitle = job.query.slice(0, 80) || "生成画像";
+    artifact = {
+      buffer: imageBuffer,
+      contentType: "image/png",
+      extension: ".png",
+      format: job.format,
+      spec: { title: artifactTitle, summary: "" },
+    };
+  } else {
+    artifact = await buildArtifact(
+      job.format,
+      parseArtifactSpecText(generated.answer),
+      { sources: generated.webCitations },
+    );
+    artifactTitle = artifact.spec.title;
+  }
+
+  const fileName = makeGeneratedFileName(artifactTitle, artifact.extension);
+  const attachment = await uploadGeneratedBuffer({
+    buffer: artifact.buffer,
+    fileName,
+    contentType: artifact.contentType,
+    format: job.format,
+    userId: job.userId,
+    conversationId: job.conversationId,
+  });
+  const citations = [
+    ...(Array.isArray(job.citations) ? job.citations : []),
+    ...generated.webCitations,
+  ];
+  const assistantMessage = {
+    id: randomUUID(),
+    role: "assistant",
+    content:
+      job.format === "png"
+        ? `画像「${fileName}」を生成しました。`
+        : `${job.format.toUpperCase()}ファイル「${fileName}」を生成しました。${artifact.spec.summary ? `\n\n${artifact.spec.summary}` : ""}`,
+    citations,
+    attachmentIds: [attachment.id],
+    meta: { ...preparedMeta, artifactJobId: job.id },
+    responseId: generated.responseId,
+    createdAt: nowIso(),
+  };
+  const savedConversation = await appendGeneratedResult(
+    conversation,
+    attachment,
+    assistantMessage,
+  );
+  const completedAt = nowIso();
+  const completedJob = await patchArtifactJob(job, [
+    { op: "set", path: "/status", value: "completed" },
+    { op: "set", path: "/progress", value: 100 },
+    { op: "set", path: "/stage", value: "完了" },
+    { op: "set", path: "/error", value: "" },
+    { op: "set", path: "/artifact", value: attachment },
+    { op: "set", path: "/completedAt", value: completedAt },
+  ]);
+  return { job: completedJob, conversation: savedConversation, usage: usageStatus };
+}
+
+async function reconcileArtifactJob(job) {
+  if (!job || job.status === "completed" || job.status === "failed") {
+    return { job };
+  }
+  await refreshUsageLease(job.usageLease);
+
+  let responseData;
+  try {
+    responseData = await retrieveBackgroundAssistant(job.responseId);
+  } catch (error) {
+    const updated = await patchArtifactJob(job, [
+      { op: "set", path: "/stage", value: "状態を再確認しています" },
+      { op: "set", path: "/lastPollError", value: String(error?.message || error) },
+    ]);
+    return { job: updated };
+  }
+
+  const providerStatus = String(responseData?.status || "").toLowerCase();
+  if (providerStatus === "queued") {
+    const updated = await patchArtifactJob(job, [
+      { op: "set", path: "/status", value: "queued" },
+      { op: "set", path: "/progress", value: Math.max(15, Number(job.progress || 0)) },
+      { op: "set", path: "/stage", value: "生成開始を待っています" },
+    ]);
+    return { job: updated };
+  }
+  if (providerStatus === "in_progress") {
+    const updated = await patchArtifactJob(job, [
+      { op: "set", path: "/status", value: "in_progress" },
+      { op: "set", path: "/progress", value: Math.max(55, Number(job.progress || 0)) },
+      { op: "set", path: "/stage", value: "AIが資料内容を作成しています" },
+    ]);
+    return { job: updated };
+  }
+  if (providerStatus !== "completed") {
+    const failed = await markArtifactJobFailed(
+      job,
+      getBackgroundResponseError(responseData),
+      responseData?.usage,
+    );
+    return { job: failed, usage: failed.usageStatus || null };
+  }
+
+  job = await patchArtifactJob(job, [
+    { op: "set", path: "/status", value: "finalizing" },
+    { op: "set", path: "/progress", value: 85 },
+    { op: "set", path: "/stage", value: "ダウンロードファイルを組み立てています" },
+  ]);
+  try {
+    const finalized = await finalizeArtifactJob(job, responseData);
+    if (finalized?.job) return finalized;
+    return { job: finalized };
+  } catch (error) {
+    const latestJob = (await getArtifactJob(job.userId, job.id)) || job;
+    const failed = await markArtifactJobFailed(
+      latestJob,
+      error instanceof Error ? error.message : "ファイル生成に失敗しました。",
+      responseData?.usage,
+    );
+    return { job: failed, usage: failed.usageStatus || null };
+  }
 }
 
 async function runAssistantFromPayload(payload, options = {}) {
@@ -3191,6 +3732,252 @@ app.http("chat-attachments", {
         req,
         principal,
         action: "chat.attachments",
+        statusCode,
+        latencyMs: Date.now() - startedAt,
+        errorMessage,
+        details,
+      });
+    }
+  },
+});
+
+app.http("chat-artifact-jobs", {
+  methods: ["GET", "POST", "OPTIONS"],
+  authLevel: "anonymous",
+  route: "chat/{id:guid}/artifact/jobs",
+  handler: async (req) => {
+    if (req.method === "OPTIONS") {
+      return { status: 204, headers: getCorsHeaders(req) };
+    }
+    const startedAt = Date.now();
+    let principal = null;
+    let statusCode = 500;
+    let errorMessage = "";
+    let details = {};
+    const auditAction = req.method === "GET" ? "artifact.jobs.list" : "artifact.jobs.create";
+    try {
+      const authContext = await getAuthContext(req);
+      if (!authContext.ok) {
+        statusCode = 401;
+        errorMessage = authContext.message || "";
+        return jsonResponse(req, 401, { error: authContext.message });
+      }
+      principal = authContext.principal;
+      const conversationId = String(req.params?.id || "").trim();
+      const conversation = await getConversation(principal.userId, conversationId);
+      if (!conversation) {
+        statusCode = 404;
+        errorMessage = "conversation not found.";
+        return jsonResponse(req, 404, { error: errorMessage });
+      }
+
+      if (req.method === "GET") {
+        const jobs = await listArtifactJobs(principal.userId, conversationId);
+        statusCode = 200;
+        details = { conversationId, jobCount: jobs.length };
+        return jsonResponse(req, 200, {
+          jobs: jobs.map((job) => toClientArtifactJob(job)),
+        });
+      }
+
+      let payload = {};
+      try {
+        payload = await req.json();
+      } catch {
+        statusCode = 400;
+        errorMessage = "Invalid JSON body.";
+        return jsonResponse(req, 400, { error: errorMessage });
+      }
+      const format = String(payload?.format || "").trim().toLowerCase();
+      if (!ARTIFACT_FORMATS.has(format)) {
+        statusCode = 400;
+        errorMessage = "format must be pptx, docx, xlsx, pdf, or png.";
+        return jsonResponse(req, 400, { error: errorMessage });
+      }
+
+      const result = await enqueueArtifactJob({
+        principal,
+        conversation,
+        payload,
+        format,
+      });
+      if (!result.ok) {
+        statusCode = result.status;
+        errorMessage = result.error || "";
+        return jsonResponse(req, result.status, {
+          error: result.error,
+          code: result.code,
+          usage: result.usage,
+          userMessageSaved: !!result.userMessageSaved,
+          conversation: result.conversation
+            ? toClientConversation(result.conversation)
+            : undefined,
+        });
+      }
+      statusCode = 202;
+      details = {
+        conversationId,
+        jobId: result.job.id,
+        format,
+      };
+      return jsonResponse(req, 202, {
+        job: toClientArtifactJob(result.job),
+        usage: result.usage,
+        conversation: toClientConversation(result.conversation),
+      });
+    } catch (error) {
+      errorMessage =
+        error instanceof Error ? error.message : "Artifact job request failed.";
+      statusCode = 500;
+      return jsonResponse(req, 500, { error: errorMessage });
+    } finally {
+      await writeAuditLog({
+        req,
+        principal,
+        action: auditAction,
+        statusCode,
+        latencyMs: Date.now() - startedAt,
+        errorMessage,
+        details,
+      });
+    }
+  },
+});
+
+app.http("chat-artifact-job", {
+  methods: ["GET", "OPTIONS"],
+  authLevel: "anonymous",
+  route: "chat/{id:guid}/artifact/jobs/{jobId:guid}",
+  handler: async (req) => {
+    if (req.method === "OPTIONS") {
+      return { status: 204, headers: getCorsHeaders(req) };
+    }
+    const startedAt = Date.now();
+    let principal = null;
+    let statusCode = 500;
+    let errorMessage = "";
+    let details = {};
+    try {
+      const authContext = await getAuthContext(req);
+      if (!authContext.ok) {
+        statusCode = 401;
+        errorMessage = authContext.message || "";
+        return jsonResponse(req, 401, { error: authContext.message });
+      }
+      principal = authContext.principal;
+      const conversationId = String(req.params?.id || "").trim();
+      const jobId = String(req.params?.jobId || "").trim();
+      let job = await getArtifactJob(principal.userId, jobId);
+      if (!job || job.conversationId !== conversationId) {
+        statusCode = 404;
+        errorMessage = "artifact job not found.";
+        return jsonResponse(req, 404, { error: errorMessage });
+      }
+      const result = await reconcileArtifactJob(job);
+      job = result.job;
+      statusCode = 200;
+      details = { conversationId, jobId, jobStatus: job?.status || "" };
+      return jsonResponse(req, 200, {
+        job: toClientArtifactJob(job),
+        usage: result.usage || job?.usageStatus || null,
+        conversation: result.conversation
+          ? toClientConversation(result.conversation)
+          : undefined,
+      });
+    } catch (error) {
+      errorMessage =
+        error instanceof Error ? error.message : "Artifact job lookup failed.";
+      statusCode = 500;
+      return jsonResponse(req, 500, { error: errorMessage });
+    } finally {
+      await writeAuditLog({
+        req,
+        principal,
+        action: "artifact.jobs.get",
+        statusCode,
+        latencyMs: Date.now() - startedAt,
+        errorMessage,
+        details,
+      });
+    }
+  },
+});
+
+app.http("chat-artifact-job-retry", {
+  methods: ["POST", "OPTIONS"],
+  authLevel: "anonymous",
+  route: "chat/{id:guid}/artifact/jobs/{jobId:guid}/retry",
+  handler: async (req) => {
+    if (req.method === "OPTIONS") {
+      return { status: 204, headers: getCorsHeaders(req) };
+    }
+    const startedAt = Date.now();
+    let principal = null;
+    let statusCode = 500;
+    let errorMessage = "";
+    let details = {};
+    try {
+      const authContext = await getAuthContext(req);
+      if (!authContext.ok) {
+        statusCode = 401;
+        errorMessage = authContext.message || "";
+        return jsonResponse(req, 401, { error: authContext.message });
+      }
+      principal = authContext.principal;
+      const conversationId = String(req.params?.id || "").trim();
+      const jobId = String(req.params?.jobId || "").trim();
+      const job = await getArtifactJob(principal.userId, jobId);
+      if (!job || job.conversationId !== conversationId) {
+        statusCode = 404;
+        errorMessage = "artifact job not found.";
+        return jsonResponse(req, 404, { error: errorMessage });
+      }
+      if (job.status !== "failed") {
+        statusCode = 409;
+        errorMessage = "Only failed jobs can be retried.";
+        return jsonResponse(req, 409, { error: errorMessage });
+      }
+      const conversation = await getConversation(principal.userId, conversationId);
+      if (!conversation) {
+        statusCode = 404;
+        errorMessage = "conversation not found.";
+        return jsonResponse(req, 404, { error: errorMessage });
+      }
+      const payload = job.requestPayload || {};
+      const format = String(payload.format || job.format || "").toLowerCase();
+      const result = await enqueueArtifactJob({
+        principal,
+        conversation,
+        payload,
+        format,
+        saveUserMessage: false,
+        retryOf: job.id,
+      });
+      if (!result.ok) {
+        statusCode = result.status;
+        errorMessage = result.error || "";
+        return jsonResponse(req, result.status, {
+          error: result.error,
+          code: result.code,
+          usage: result.usage,
+        });
+      }
+      statusCode = 202;
+      details = { conversationId, jobId: result.job.id, retryOf: job.id };
+      return jsonResponse(req, 202, {
+        job: toClientArtifactJob(result.job),
+        usage: result.usage,
+      });
+    } catch (error) {
+      errorMessage =
+        error instanceof Error ? error.message : "Artifact job retry failed.";
+      statusCode = 500;
+      return jsonResponse(req, 500, { error: errorMessage });
+    } finally {
+      await writeAuditLog({
+        req,
+        principal,
+        action: "artifact.jobs.retry",
         statusCode,
         latencyMs: Date.now() - startedAt,
         errorMessage,
