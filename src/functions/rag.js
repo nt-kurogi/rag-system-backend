@@ -47,7 +47,7 @@ const config = {
   openAiGpt56DefaultModel:
     process.env.AZURE_OPENAI_GPT56_DEFAULT_MODEL || "gpt-5.6-sol",
   openAiMaxOutputTokens: Number(
-    process.env.AZURE_OPENAI_MAX_OUTPUT_TOKENS || 4000,
+    process.env.AZURE_OPENAI_MAX_OUTPUT_TOKENS || 8000,
   ),
   openAiInputTokenCountEnabled:
     String(
@@ -2267,7 +2267,7 @@ async function prepareAssistantRequest(
     input: buildModelInput({ mode, query, context, conversation, attachments }),
     max_output_tokens: Math.max(
       256,
-      Math.min(32000, Math.floor(config.openAiMaxOutputTokens || 4000)),
+      Math.min(32000, Math.floor(config.openAiMaxOutputTokens || 8000)),
     ),
   };
   if (mode === MODE_GPT56) {
