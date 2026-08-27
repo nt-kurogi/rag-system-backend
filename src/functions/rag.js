@@ -2404,7 +2404,7 @@ async function prepareArtifactRequest(payload, conversation, validation, format)
   };
   prepared.body.max_output_tokens = Math.max(
     prepared.body.max_output_tokens,
-    Math.min(12_000, config.openAiMaxOutputTokens * 2),
+    8_000,
   );
   prepared.meta.artifactFormat = format;
   return prepared;
