@@ -327,6 +327,47 @@ const ATTACHMENT_EXTENSIONS = new Set([
 
 const searchCredential = new AzureKeyCredential(config.searchApiKey);
 
+const requestIdCache = new WeakMap();
+
+function normalizeRequestId(value) {
+  const requestId = String(value || "").trim();
+  return /^[a-zA-Z0-9._:-]{8,100}$/.test(requestId) ? requestId : "";
+}
+
+function getRequestId(req) {
+  if (req && requestIdCache.has(req)) {
+    return requestIdCache.get(req);
+  }
+  const requestId =
+    normalizeRequestId(req?.headers?.get("x-request-id")) || randomUUID();
+  if (req) requestIdCache.set(req, requestId);
+  return requestId;
+}
+
+function sanitizeDiagnosticText(value) {
+  return String(value || "")
+    .replace(
+      /(https:\/\/[^\s?"']+\.blob\.core\.windows\.net\/[^\s?"']+)\?[^\s"']+/gi,
+      "$1?[redacted]",
+    )
+    .replace(/(api-key|authorization)["'\s:=]+[^\s,"']+/gi, "$1=[redacted]")
+    .slice(0, 4000);
+}
+
+function writeDiagnosticLog(level, event, req, details = {}) {
+  const payload = {
+    timestamp: nowIso(),
+    event: String(event || "unknown"),
+    requestId: getRequestId(req),
+    ...details,
+  };
+  if (payload.errorMessage) {
+    payload.errorMessage = sanitizeDiagnosticText(payload.errorMessage);
+  }
+  const writer = console[level] || console.log;
+  writer(`[diagnostic] ${JSON.stringify(payload)}`);
+}
+
 function getCorsHeaders(req) {
   const origin = req.headers.get("origin") || "";
   const allowOrigin =
@@ -337,7 +378,10 @@ function getCorsHeaders(req) {
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type,api-key,Authorization",
+    "Access-Control-Allow-Headers":
+      "Content-Type,api-key,Authorization,X-Request-ID",
+    "Access-Control-Expose-Headers": "X-Request-ID",
+    "X-Request-ID": getRequestId(req),
   };
 }
 
@@ -568,6 +612,7 @@ async function writeAuditLog({
       id: randomUUID(),
       dateKey: toDateKey(createdAt),
       createdAt,
+      requestId: getRequestId(req),
       action: String(action || "unknown"),
       method: req.method,
       path: getPathname(req),
@@ -578,7 +623,7 @@ async function writeAuditLog({
       userName: String(principal?.userName || "anonymous"),
       ip: getClientIp(req),
       userAgent: req.headers.get("user-agent") || "",
-      errorMessage: String(errorMessage || ""),
+      errorMessage: sanitizeDiagnosticText(errorMessage),
       details: details && typeof details === "object" ? details : {},
     };
     await container.items.create(item);
@@ -3212,6 +3257,7 @@ function makeStreamingResponse({
         }
         send("error", {
           error: errorMessage,
+          requestId: getRequestId(req),
           userMessageSaved: true,
           usage: usageStatus,
           conversation: toClientConversation(latestConversation),
@@ -3229,6 +3275,7 @@ function makeStreamingResponse({
           errorMessage,
           details: {
             conversationId: conversation.id,
+            stage: "openai_stream",
             mode: prepared.meta?.mode || "",
             attachmentCount: prepared.meta?.attachmentCount || 0,
             model: prepared.meta?.model || "",
@@ -3238,6 +3285,22 @@ function makeStreamingResponse({
             estimatedCostUsd: prepared.meta?.usage?.estimatedCostUsd || 0,
           },
         });
+        writeDiagnosticLog(
+          statusCode >= 400 ? "error" : "info",
+          statusCode >= 400
+            ? "chat.message.stream.failed"
+            : "chat.message.stream.completed",
+          req,
+          {
+            statusCode,
+            latencyMs: Date.now() - startedAt,
+            stage: "openai_stream",
+            errorMessage,
+            conversationId: conversation.id,
+            attachmentCount: prepared.meta?.attachmentCount || 0,
+            model: prepared.meta?.model || "",
+          },
+        );
         try {
           controller.close();
         } catch {
@@ -3643,6 +3706,7 @@ app.http("chat-attachments", {
     let statusCode = 500;
     let errorMessage = "";
     let details = {};
+    let stage = "authenticate";
 
     try {
       const authContext = await getAuthContext(req);
@@ -3653,6 +3717,7 @@ app.http("chat-attachments", {
       }
       principal = authContext.principal;
 
+      stage = "load_conversation";
       const conversationId = String(req.params?.id || "").trim();
       if (!conversationId) {
         statusCode = 400;
@@ -3667,6 +3732,7 @@ app.http("chat-attachments", {
         return jsonResponse(req, 404, { error: errorMessage });
       }
 
+      stage = "parse_multipart";
       let formData;
       try {
         formData = await req.formData();
@@ -3679,6 +3745,14 @@ app.http("chat-attachments", {
       const files = formData
         .getAll("files")
         .filter((value) => value && typeof value.arrayBuffer === "function");
+      details = {
+        conversationId,
+        attachmentCount: files.length,
+        totalBytes: files.reduce((sum, file) => sum + Number(file.size || 0), 0),
+        extensions: files.map((file) =>
+          extname(sanitizeFileName(file?.name)).toLowerCase() || "unknown",
+        ),
+      };
       const maxFiles = Math.max(1, Math.min(10, config.attachmentMaxFiles || 5));
       if (files.length === 0) {
         statusCode = 400;
@@ -3691,6 +3765,7 @@ app.http("chat-attachments", {
         return jsonResponse(req, 400, { error: errorMessage });
       }
 
+      stage = "validate_files";
       for (const file of files) {
         const validation = validateAttachmentFile(file);
         if (!validation.ok) {
@@ -3700,6 +3775,7 @@ app.http("chat-attachments", {
         }
       }
 
+      stage = "blob_upload";
       const attachments = [];
       for (const file of files) {
         attachments.push(
@@ -3710,14 +3786,16 @@ app.http("chat-attachments", {
           }),
         );
       }
+      stage = "save_conversation";
       const saved = await appendConversationAttachments(conversation, attachments);
 
       statusCode = 200;
       details = {
-        conversationId,
+        ...details,
         attachmentCount: attachments.length,
         totalBytes: attachments.reduce((sum, item) => sum + item.size, 0),
       };
+      stage = "complete";
       return jsonResponse(req, 200, {
         attachments: attachments.map((item) => toClientAttachment(item)),
         conversation: toClientConversation(saved),
@@ -3728,6 +3806,20 @@ app.http("chat-attachments", {
       errorMessage = message;
       return jsonResponse(req, 500, { error: message });
     } finally {
+      writeDiagnosticLog(
+        statusCode >= 400 ? "error" : "info",
+        statusCode >= 400
+          ? "chat.attachments.failed"
+          : "chat.attachments.completed",
+        req,
+        {
+          statusCode,
+          latencyMs: Date.now() - startedAt,
+          stage,
+          errorMessage,
+          ...details,
+        },
+      );
       await writeAuditLog({
         req,
         principal,
@@ -3735,7 +3827,7 @@ app.http("chat-attachments", {
         statusCode,
         latencyMs: Date.now() - startedAt,
         errorMessage,
-        details,
+        details: { ...details, stage },
       });
     }
   },
@@ -4390,6 +4482,7 @@ app.http("chat-message-stream", {
     let userSavedConversation = null;
     let auditInStream = false;
     let usageLease = null;
+    let stage = "authenticate";
 
     try {
       const authContext = await getAuthContext(req);
@@ -4400,6 +4493,7 @@ app.http("chat-message-stream", {
       }
       principal = authContext.principal;
 
+      stage = "parse_request";
       const conversationId = String(req.params?.id || "").trim();
       if (!conversationId) {
         statusCode = 400;
@@ -4416,6 +4510,7 @@ app.http("chat-message-stream", {
         return jsonResponse(req, 400, { error: errorMessage });
       }
 
+      stage = "load_conversation";
       const conversation = await getConversation(principal.userId, conversationId);
       if (!conversation) {
         statusCode = 404;
@@ -4423,6 +4518,7 @@ app.http("chat-message-stream", {
         return jsonResponse(req, 404, { error: errorMessage });
       }
 
+      stage = "validate_request";
       const validation = validateAssistantPayload(payload, conversation);
       if (!validation.ok) {
         statusCode = validation.status;
@@ -4437,6 +4533,7 @@ app.http("chat-message-stream", {
         attachmentIds: validation.attachmentIds,
         createdAt: nowIso(),
       };
+      stage = "save_user_message";
       userSavedConversation = await appendConversationMessage(
         conversation,
         userMessage,
@@ -4446,6 +4543,7 @@ app.http("chat-message-stream", {
         },
       );
 
+      stage = "prepare_openai_request";
       const prepared = await prepareAssistantRequest(
         { ...payload, query: validation.query },
         { conversation, validated: validation },
@@ -4460,7 +4558,19 @@ app.http("chat-message-stream", {
         });
       }
 
+      details = {
+        conversationId,
+        mode: prepared.meta?.mode || "",
+        attachmentCount: prepared.meta?.attachmentCount || 0,
+        attachmentExtensions: validation.attachments.map((attachment) =>
+          extname(String(attachment?.name || "")).toLowerCase() || "unknown",
+        ),
+        model: prepared.meta?.model || "",
+        reasoningEffort: prepared.meta?.reasoningEffort || null,
+      };
+      stage = "count_input_tokens";
       const inputTokens = await countPreparedInputTokens(prepared);
+      stage = "reserve_usage";
       usageLease = await reserveUsage(principal, {
         inputTokens,
         maxOutputTokens: prepared.body.max_output_tokens,
@@ -4481,14 +4591,8 @@ app.http("chat-message-stream", {
         });
       }
 
+      stage = "openai_request";
       const upstream = await requestAssistant(prepared, { stream: true });
-      details = {
-        conversationId,
-        mode: prepared.meta?.mode || "",
-        attachmentCount: prepared.meta?.attachmentCount || 0,
-        model: prepared.meta?.model || "",
-        reasoningEffort: prepared.meta?.reasoningEffort || null,
-      };
       statusCode = 200;
       auditInStream = true;
       return makeStreamingResponse({
@@ -4522,6 +4626,20 @@ app.http("chat-message-stream", {
       });
     } finally {
       if (!auditInStream) {
+        writeDiagnosticLog(
+          statusCode >= 400 ? "error" : "info",
+          statusCode >= 400
+            ? "chat.message.stream.failed"
+            : "chat.message.stream.completed",
+          req,
+          {
+            statusCode,
+            latencyMs: Date.now() - startedAt,
+            stage,
+            errorMessage,
+            ...details,
+          },
+        );
         await writeAuditLog({
           req,
           principal,
@@ -4529,7 +4647,7 @@ app.http("chat-message-stream", {
           statusCode,
           latencyMs: Date.now() - startedAt,
           errorMessage,
-          details,
+          details: { ...details, stage },
         });
       }
     }
