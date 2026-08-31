@@ -6,7 +6,8 @@
   "main": "src/functions/*.js",
   "scripts": {
     "start": "func start",
-    "dev": "func start --verbose"
+    "dev": "func start --verbose",
+    "test": "node --test"
   },
   "dependencies": {
     "@azure/cosmos": "^4.9.2",

@@ -12,6 +12,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import { randomUUID } from "node:crypto";
 import { extname } from "node:path";
 import { buildArtifact } from "../lib/artifacts.js";
+import { toRemoteFileInput } from "../lib/openai-input.js";
 
 app.setup({ enableHttpStream: true });
 
@@ -2188,11 +2189,7 @@ function toModelAttachmentContent(attachment) {
   if (String(attachment.contentType || "").startsWith("image/")) {
     return { type: "input_image", image_url: url, detail: "auto" };
   }
-  return {
-    type: "input_file",
-    file_url: url,
-    filename: attachment.name || "attachment",
-  };
+  return toRemoteFileInput(url);
 }
 
 function buildUserContent(text, attachments) {
