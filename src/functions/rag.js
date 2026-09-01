@@ -1453,6 +1453,7 @@ function sanitizeArtifactJobPayload(payload, format) {
   return {
     query: String(payload?.query || "").trim(),
     format,
+    autoDetectedOutputFormat: payload?.autoDetectedOutputFormat === true,
     modelId: String(payload?.modelId || "").trim(),
     reasoningEffort: String(payload?.reasoningEffort || "").trim(),
     templateId: String(payload?.templateId || "default").trim(),
@@ -2711,6 +2712,7 @@ async function enqueueArtifactJob({
       content: validation.query,
       attachmentIds: validation.attachmentIds,
       requestedArtifactFormat: format,
+      autoDetectedOutputFormat: payload?.autoDetectedOutputFormat === true,
       createdAt: nowIso(),
     };
     savedConversation = await appendConversationMessage(
@@ -3908,6 +3910,7 @@ app.http("chat-artifact-jobs", {
         conversationId,
         jobId: result.job.id,
         format,
+        autoDetectedOutputFormat: payload?.autoDetectedOutputFormat === true,
       };
       return jsonResponse(req, 202, {
         job: toClientArtifactJob(result.job),
