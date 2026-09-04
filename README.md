@@ -18,7 +18,7 @@ npm install
 - `AZURE_OPENAI_DEPLOYMENT_GPT56_SOL`（任意。既定 `gpt-5.6-sol`）
 - `AZURE_OPENAI_DEPLOYMENT_GPT56_TERRA`（任意。既定 `gpt-5.6-terra`）
 - `AZURE_OPENAI_DEPLOYMENT_GPT56_LUNA`（任意。既定 `gpt-5.6-luna`）
-- `AZURE_OPENAI_GPT56_DEFAULT_MODEL`（既定 `gpt-5.6-sol`）
+- `AZURE_OPENAI_GPT56_DEFAULT_MODEL`（既定 `auto`。通常はLuna、複雑な依頼はTerra。Solは手動選択のみ）
 - `AZURE_SEARCH_ENDPOINT`
 - `AZURE_SEARCH_API_KEY`
 - `AZURE_SEARCH_INDEX`
@@ -94,7 +94,7 @@ npm run start
 }
 ```
 
-通常チャットでは `mode` に `gpt56` を指定します。`modelId` はバックエンドで設定済みの `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` から選びます。未設定モデルをリクエストしても任意のAzureデプロイへはアクセスできません。`reasoningEffort` は `none`、`low`、`medium`、`high`、`xhigh` を指定できます。
+通常チャットでは `mode` に `gpt56` を指定します。`modelId` は `auto`、またはバックエンドで設定済みの `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` から選びます。`auto` は通常処理にLunaを使い、複数ファイル、Office/PDF生成、複雑な分析・設計などをTerraへ切り替えます。Solは自動判定の対象外で、手動指定時のみ使用します。未設定モデルをリクエストしても任意のAzureデプロイへはアクセスできません。`reasoningEffort` は `none`、`low`、`medium`、`high`、`xhigh` を指定できます。
 
 ```json
 {

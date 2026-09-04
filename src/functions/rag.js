@@ -13,6 +13,12 @@ import { randomUUID } from "node:crypto";
 import { extname } from "node:path";
 import { buildArtifact } from "../lib/artifacts.js";
 import { toRemoteFileInput } from "../lib/openai-input.js";
+import {
+  AUTO_MODEL_ID,
+  LUNA_MODEL_ID,
+  TERRA_MODEL_ID,
+  routeGpt56Model,
+} from "../lib/model-router.js";
 
 app.setup({ enableHttpStream: true });
 
@@ -46,7 +52,7 @@ const config = {
   openAiDeploymentGpt56Luna:
     process.env.AZURE_OPENAI_DEPLOYMENT_GPT56_LUNA || "gpt-5.6-luna",
   openAiGpt56DefaultModel:
-    process.env.AZURE_OPENAI_GPT56_DEFAULT_MODEL || "gpt-5.6-sol",
+    process.env.AZURE_OPENAI_GPT56_DEFAULT_MODEL || AUTO_MODEL_ID,
   openAiMaxOutputTokens: Number(
     process.env.AZURE_OPENAI_MAX_OUTPUT_TOKENS || 8000,
   ),
@@ -284,15 +290,24 @@ function getConfiguredGpt56Models() {
     }));
 }
 
-function getDefaultGpt56Model(models = getConfiguredGpt56Models()) {
-  const configuredDefault = normalizeGpt56ModelId(
-    config.openAiGpt56DefaultModel,
+function getDefaultGpt56SelectionId(models = getConfiguredGpt56Models()) {
+  const configuredDefault = normalizeGpt56ModelId(config.openAiGpt56DefaultModel);
+  const autoAvailable = models.some(
+    (item) => item.id === LUNA_MODEL_ID || item.id === TERRA_MODEL_ID,
   );
-  return (
-    models.find((item) => item.id === configuredDefault) ||
-    models[0] ||
-    null
-  );
+  if (configuredDefault === AUTO_MODEL_ID && autoAvailable) return AUTO_MODEL_ID;
+  if (models.some((item) => item.id === configuredDefault)) return configuredDefault;
+  return autoAvailable ? AUTO_MODEL_ID : models[0]?.id || null;
+}
+
+function getAutoGpt56ModelOption() {
+  return {
+    id: AUTO_MODEL_ID,
+    label: "自動（Luna基準）",
+    description: "通常はLuna、複雑な依頼はTerraへ自動切り替え。Solは手動選択のみ",
+    reasoningEfforts: GPT56_REASONING_EFFORTS,
+    defaultReasoningEffort: "medium",
+  };
 }
 
 function toClientModel(model) {
@@ -303,6 +318,16 @@ function toClientModel(model) {
     description: model.description,
     reasoningEfforts: model.reasoningEfforts,
     defaultReasoningEffort: model.defaultReasoningEffort,
+  };
+}
+
+function toModelRoutingAuditDetails(meta) {
+  if (!meta || meta.mode !== MODE_GPT56) return {};
+  return {
+    requestedModelId: meta.requestedModelId || "",
+    modelSelection: meta.modelSelection || "",
+    routingReason: meta.routingReason || "",
+    routingScore: Number(meta.routingScore || 0),
   };
 }
 
@@ -2164,6 +2189,9 @@ function normalizeGpt56ModelId(value) {
   const raw = String(value || "").trim().toLowerCase();
   const aliases = {
     "": "",
+    auto: AUTO_MODEL_ID,
+    automatic: AUTO_MODEL_ID,
+    "自動": AUTO_MODEL_ID,
     "gpt-5.6": "gpt-5.6-sol",
     gpt56: "gpt-5.6-sol",
     sol: "gpt-5.6-sol",
@@ -2171,6 +2199,40 @@ function normalizeGpt56ModelId(value) {
     luna: "gpt-5.6-luna",
   };
   return aliases[raw] || raw;
+}
+
+function getPreviousAutomaticModelId(conversation) {
+  const messages = Array.isArray(conversation?.messages)
+    ? conversation.messages
+    : [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== "assistant") continue;
+    return message?.meta?.modelSelection === AUTO_MODEL_ID
+      ? normalizeGpt56ModelId(message.meta.model)
+      : "";
+  }
+  return "";
+}
+
+function selectAutomaticGpt56Model(models, routing) {
+  const preferredIds =
+    routing.modelId === TERRA_MODEL_ID
+      ? [TERRA_MODEL_ID, LUNA_MODEL_ID]
+      : [LUNA_MODEL_ID, TERRA_MODEL_ID];
+  const selectedModel = preferredIds
+    .map((modelId) => models.find((item) => item.id === modelId))
+    .find(Boolean);
+  if (!selectedModel) return { selectedModel: null, routing };
+  if (selectedModel.id === routing.modelId) return { selectedModel, routing };
+  return {
+    selectedModel,
+    routing: {
+      ...routing,
+      modelId: selectedModel.id,
+      reason: `${routing.reason}（対象モデル未設定のため${selectedModel.label}を使用）`,
+    },
+  };
 }
 
 function getAttachmentsForMessage(conversation, message) {
@@ -2336,10 +2398,13 @@ function validateAssistantPayload(payload, conversation) {
   const webSearch = mode === MODE_GPT56 && payload?.webSearch !== false;
   let selectedModel = null;
   let reasoningEffort = null;
+  let requestedModelId = null;
+  let modelSelection = null;
+  let routingReason = null;
+  let routingScore = null;
   if (mode === MODE_GPT56) {
     const models = getConfiguredGpt56Models();
-    const defaultModel = getDefaultGpt56Model(models);
-    if (!defaultModel) {
+    if (models.length === 0) {
       return {
         ok: false,
         status: 500,
@@ -2347,15 +2412,38 @@ function validateAssistantPayload(payload, conversation) {
           "GPT-5.6 deployment is not configured. Set AZURE_OPENAI_DEPLOYMENT_GPT56_SOL, _TERRA, or _LUNA.",
       };
     }
-    const requestedModelId = normalizeGpt56ModelId(payload?.modelId);
-    selectedModel = requestedModelId
-      ? models.find((item) => item.id === requestedModelId)
-      : defaultModel;
+    requestedModelId =
+      normalizeGpt56ModelId(payload?.modelId) ||
+      getDefaultGpt56SelectionId(models);
+
+    if (requestedModelId === AUTO_MODEL_ID) {
+      const routing = routeGpt56Model({
+        query,
+        attachments,
+        templateId,
+        format: payload?.format,
+        webSearch,
+        previousModelId: getPreviousAutomaticModelId(conversation),
+      });
+      const automaticSelection = selectAutomaticGpt56Model(models, routing);
+      selectedModel = automaticSelection.selectedModel;
+      modelSelection = AUTO_MODEL_ID;
+      routingReason = automaticSelection.routing.reason;
+      routingScore = automaticSelection.routing.score;
+    } else {
+      selectedModel = models.find((item) => item.id === requestedModelId);
+      modelSelection = "manual";
+      routingReason = "ユーザーが手動でモデルを選択";
+      routingScore = 0;
+    }
     if (!selectedModel) {
       return {
         ok: false,
         status: 400,
-        error: "The selected GPT-5.6 model is not enabled for this app.",
+        error:
+          requestedModelId === AUTO_MODEL_ID
+            ? "Automatic routing requires GPT-5.6 Luna or Terra to be enabled."
+            : "The selected GPT-5.6 model is not enabled for this app.",
       };
     }
     const requestedReasoningEffort = String(
@@ -2388,6 +2476,10 @@ function validateAssistantPayload(payload, conversation) {
     webSearch,
     selectedModel,
     reasoningEffort,
+    requestedModelId,
+    modelSelection,
+    routingReason,
+    routingScore,
   };
 }
 
@@ -2408,6 +2500,10 @@ async function prepareAssistantRequest(
     webSearch,
     selectedModel,
     reasoningEffort,
+    requestedModelId,
+    modelSelection,
+    routingReason,
+    routingScore,
   } = validation;
 
   let indexName = null;
@@ -2461,6 +2557,10 @@ async function prepareAssistantRequest(
     templateId,
     webSearch,
     reasoningEffort: mode === MODE_GPT56 ? reasoningEffort : null,
+    requestedModelId: mode === MODE_GPT56 ? requestedModelId : null,
+    modelSelection: mode === MODE_GPT56 ? modelSelection : null,
+    routingReason: mode === MODE_GPT56 ? routingReason : null,
+    routingScore: mode === MODE_GPT56 ? routingScore : null,
   };
 
   const body = {
@@ -3279,6 +3379,7 @@ function makeStreamingResponse({
             attachmentCount: prepared.meta?.attachmentCount || 0,
             model: prepared.meta?.model || "",
             reasoningEffort: prepared.meta?.reasoningEffort || null,
+            ...toModelRoutingAuditDetails(prepared.meta),
             totalTokens: prepared.meta?.usage?.totalTokens || 0,
             weightedTokens: prepared.meta?.usage?.weightedTokens || 0,
             estimatedCostUsd: prepared.meta?.usage?.estimatedCostUsd || 0,
@@ -3363,11 +3464,16 @@ app.http("model-list", {
       }
       principal = authContext.principal;
       const configuredModels = getConfiguredGpt56Models();
-      const defaultModel = getDefaultGpt56Model(configuredModels);
+      const autoAvailable = configuredModels.some(
+        (model) => model.id === LUNA_MODEL_ID || model.id === TERRA_MODEL_ID,
+      );
       statusCode = 200;
       return jsonResponse(req, 200, {
-        defaultModelId: defaultModel?.id || null,
-        models: configuredModels.map((model) => toClientModel(model)),
+        defaultModelId: getDefaultGpt56SelectionId(configuredModels),
+        models: [
+          ...(autoAvailable ? [getAutoGpt56ModelOption()] : []),
+          ...configuredModels.map((model) => toClientModel(model)),
+        ],
       });
     } catch (error) {
       errorMessage =
@@ -3911,6 +4017,9 @@ app.http("chat-artifact-jobs", {
         jobId: result.job.id,
         format,
         autoDetectedOutputFormat: payload?.autoDetectedOutputFormat === true,
+        model: result.job.preparedMeta?.model || "",
+        reasoningEffort: result.job.preparedMeta?.reasoningEffort || null,
+        ...toModelRoutingAuditDetails(result.job.preparedMeta),
       };
       return jsonResponse(req, 202, {
         job: toClientArtifactJob(result.job),
@@ -4270,6 +4379,7 @@ app.http("chat-artifact", {
         format,
         model: prepared.meta.model,
         reasoningEffort: prepared.meta.reasoningEffort,
+        ...toModelRoutingAuditDetails(prepared.meta),
         fileBytes: attachment.size,
         totalTokens: prepared.meta.usage.totalTokens,
         weightedTokens: prepared.meta.usage.weightedTokens,
@@ -4423,6 +4533,7 @@ app.http("chat-message", {
         attachmentCount: result.meta?.attachmentCount || 0,
         model: result.meta?.model || "",
         reasoningEffort: result.meta?.reasoningEffort || null,
+        ...toModelRoutingAuditDetails(result.meta),
         totalTokens: result.meta?.usage?.totalTokens || 0,
         weightedTokens: result.meta?.usage?.weightedTokens || 0,
         estimatedCostUsd: result.meta?.usage?.estimatedCostUsd || 0,
@@ -4567,6 +4678,7 @@ app.http("chat-message-stream", {
         ),
         model: prepared.meta?.model || "",
         reasoningEffort: prepared.meta?.reasoningEffort || null,
+        ...toModelRoutingAuditDetails(prepared.meta),
       };
       stage = "count_input_tokens";
       const inputTokens = await countPreparedInputTokens(prepared);
