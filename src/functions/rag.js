@@ -295,9 +295,12 @@ function getDefaultGpt56SelectionId(models = getConfiguredGpt56Models()) {
   const autoAvailable = models.some(
     (item) => item.id === LUNA_MODEL_ID || item.id === TERRA_MODEL_ID,
   );
-  if (configuredDefault === AUTO_MODEL_ID && autoAvailable) return AUTO_MODEL_ID;
+  // The application default is always automatic when Luna or Terra is
+  // available. This also supersedes a legacy production setting that selected
+  // Sol by default; Sol remains available through an explicit manual request.
+  if (autoAvailable) return AUTO_MODEL_ID;
   if (models.some((item) => item.id === configuredDefault)) return configuredDefault;
-  return autoAvailable ? AUTO_MODEL_ID : models[0]?.id || null;
+  return models[0]?.id || null;
 }
 
 function getAutoGpt56ModelOption() {
